@@ -1,0 +1,503 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import type { AddressInfo } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import type { Server } from 'node:http';
+import { after, before, describe, it } from 'node:test';
+import jwt from 'jsonwebtoken';
+import { createApp } from '../src/app';
+import type { Db } from '../src/lib/prisma';
+
+const SECRET = 'test-secret-test-secret-test-secret-123456';
+
+export interface TestDb {
+  db: Db;
+  teardown: () => Promise<void>;
+}
+
+/** Los tests de la API. Reciben una base de datos lista para usar. */
+export function defineApiTests(setup: () => Promise<TestDb>) {
+  describe('Keepr API', () => {
+    let server: Server;
+    let base: string;
+    let teardown: () => Promise<void>;
+    let uploadsDir: string;
+
+    before(async () => {
+      const ctx = await setup();
+      teardown = ctx.teardown;
+      uploadsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keepr-uploads-'));
+      const app = createApp({ db: ctx.db, jwtSecret: SECRET, bcryptCost: 4, rateLimit: false, uploadsDir });
+      server = app.listen(0);
+      base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+
+    after(async () => {
+      server?.close();
+      await teardown?.();
+      if (uploadsDir) fs.rmSync(uploadsDir, { recursive: true, force: true });
+    });
+
+    async function call(method: string, path: string, opts: { token?: string; body?: unknown; raw?: string } = {}) {
+      const res = await fetch(base + path, {
+        method,
+        headers: {
+          ...(opts.body !== undefined || opts.raw !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
+        },
+        body: opts.raw ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined),
+      });
+      const text = await res.text();
+      return { status: res.status, json: text ? JSON.parse(text) : null };
+    }
+
+    async function register(email: string, name = 'Lucia Morales') {
+      const r = await call('POST', '/auth/register', { body: { name, email, password: 'secret123' } });
+      assert.equal(r.status, 201);
+      return r.json as { token: string; user: { id: string } };
+    }
+
+    async function rawGet(p: string, token?: string) {
+      const res = await fetch(base + p, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      return { status: res.status, type: res.headers.get('content-type'), bytes: Buffer.from(await res.arrayBuffer()) };
+    }
+
+    const filesInUploads = () => fs.readdirSync(uploadsDir).length;
+    // Un JPEG mínimo: lo que se valida son los primeros bytes (FF D8 FF) y el tamaño.
+    const jpeg = (fill = 7) =>
+      Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]), Buffer.from('JFIF\0'), Buffer.alloc(200, fill), Buffer.from([0xff, 0xd9])]);
+    // Un PDF mínimo: alcanza con que empiece con "%PDF-".
+    const pdf = () => Buffer.from('%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n', 'latin1');
+
+    const validProduct = {
+      name: 'HP Victus 16',
+      category: 'Tech',
+      store: 'Fravega',
+      purchaseDate: '2026-08-13',
+      price: 1850000,
+      warrantyExpiryDate: '2027-08-13',
+    };
+
+    it('responds to /health', async () => {
+      const r = await call('GET', '/health');
+      assert.equal(r.status, 200);
+      assert.equal(r.json.status, 'ok');
+    });
+
+    it('rejects invalid registrations with per-field errors', async () => {
+      const r = await call('POST', '/auth/register', { body: { name: 'L', email: 'nope', password: '123' } });
+      assert.equal(r.status, 400);
+      assert.ok(r.json.fields.name);
+      assert.ok(r.json.fields.email);
+      assert.ok(r.json.fields.password);
+    });
+
+    it('registers, never leaks the password hash, and rejects duplicate emails (case-insensitive)', async () => {
+      const r = await call('POST', '/auth/register', {
+        body: { name: 'Ana Perez', email: '  Ana@Email.com ', password: 'secret123' },
+      });
+      assert.equal(r.status, 201);
+      assert.equal(r.json.user.email, 'ana@email.com');
+      assert.equal(r.json.user.initial, 'A');
+      assert.equal(r.json.user.plan, 'Keepr Free');
+      assert.ok(r.json.token);
+      assert.equal(JSON.stringify(r.json).includes('passwordHash'), false);
+
+      const dup = await call('POST', '/auth/register', {
+        body: { name: 'Ana 2', email: 'ANA@email.com', password: 'secret123' },
+      });
+      assert.equal(dup.status, 409);
+    });
+
+    it('logs in with the right password and gives the same error for wrong password and unknown email', async () => {
+      await register('login@email.com');
+      const ok = await call('POST', '/auth/login', { body: { email: 'LOGIN@email.com', password: 'secret123' } });
+      assert.equal(ok.status, 200);
+      assert.ok(ok.json.token);
+
+      const wrong = await call('POST', '/auth/login', { body: { email: 'login@email.com', password: 'badpass' } });
+      const unknown = await call('POST', '/auth/login', { body: { email: 'ghost@email.com', password: 'secret123' } });
+      assert.equal(wrong.status, 401);
+      assert.equal(unknown.status, 401);
+      assert.equal(wrong.json.error, unknown.json.error);
+    });
+
+    it('changes the password: needs the current one, keeps the session and the new password works', async () => {
+      const { token } = await register('pw@email.com'); // la contraseña inicial es 'secret123'
+      const change = (body: unknown) => call('POST', '/auth/change-password', { token, body });
+      const login = (password: string) =>
+        call('POST', '/auth/login', { body: { email: 'pw@email.com', password } });
+
+      // Sin sesión no se puede.
+      const anonymous = await call('POST', '/auth/change-password', {
+        body: { currentPassword: 'secret123', newPassword: 'newsecret456' },
+      });
+      assert.equal(anonymous.status, 401);
+
+      // Contraseña actual incorrecta: 400 con el error en ese campo (NUNCA 401: la app cerraría la sesión).
+      const wrong = await change({ currentPassword: 'wrongpass', newPassword: 'newsecret456' });
+      assert.equal(wrong.status, 400);
+      assert.ok(wrong.json.fields.currentPassword);
+
+      // Nueva contraseña inválida, igual a la actual, o campos que faltan.
+      const short = await change({ currentPassword: 'secret123', newPassword: '123' });
+      assert.equal(short.status, 400);
+      assert.ok(short.json.fields.newPassword);
+      const same = await change({ currentPassword: 'secret123', newPassword: 'secret123' });
+      assert.equal(same.status, 400);
+      assert.ok(same.json.fields.newPassword);
+      assert.equal((await change({})).status, 400);
+
+      // Ningún intento fallido cambió nada: la contraseña vieja sigue entrando.
+      assert.equal((await login('secret123')).status, 200);
+
+      // El cambio correcto.
+      const ok = await change({ currentPassword: 'secret123', newPassword: 'newsecret456' });
+      assert.equal(ok.status, 204);
+
+      // La sesión actual sigue activa, la contraseña vieja ya no entra y la nueva sí.
+      assert.equal((await call('GET', '/auth/me', { token })).status, 200);
+      assert.equal((await login('secret123')).status, 401);
+      assert.equal((await login('newsecret456')).status, 200);
+    });
+
+    it('deletes the account with the right password, removing its products and photos but nothing from other users', async () => {
+      const doomed = await register('doomed@email.com'); // la contraseña es 'secret123'
+      const survivor = await register('survivor@email.com');
+      const remove = (body: unknown, token?: string) => call('POST', '/auth/delete-account', { token, body });
+      const before = filesInUploads(); // los números de archivos se comparan contra este valor
+
+      // Cada uno tiene un producto con una foto de recibo.
+      const a = (await call('POST', '/products', { token: doomed.token, body: validProduct })).json.product;
+      const b = (await call('POST', '/products', { token: survivor.token, body: validProduct })).json.product;
+      for (const [id, token] of [[a.id, doomed.token], [b.id, survivor.token]] as const) {
+        const up = await call('PUT', `/products/${id}/receipt`, { token, body: { image: jpeg().toString('base64') } });
+        assert.equal(up.status, 200);
+      }
+      assert.equal(filesInUploads(), before + 2);
+
+      // Sin sesión, sin contraseña o con una incorrecta: no se borra nada.
+      assert.equal((await remove({ password: 'secret123' })).status, 401);
+      assert.equal((await remove({}, doomed.token)).status, 400);
+      // Contraseña incorrecta: 400 con el error en el campo (NUNCA 401: la app cerraría la sesión).
+      const wrong = await remove({ password: 'wrongpass' }, doomed.token);
+      assert.equal(wrong.status, 400);
+      assert.ok(wrong.json.fields.password);
+      assert.equal((await call('GET', '/auth/me', { token: doomed.token })).status, 200);
+      assert.equal(filesInUploads(), before + 2);
+
+      // Con la contraseña correcta se borra todo lo de esa cuenta.
+      assert.equal((await remove({ password: 'secret123' }, doomed.token)).status, 204);
+      assert.equal(filesInUploads(), before + 1); // se fue su foto; queda la del otro usuario
+      assert.equal((await call('GET', '/auth/me', { token: doomed.token })).status, 401); // la sesión ya no sirve
+      assert.equal((await call('GET', '/products', { token: doomed.token })).status, 401);
+      const login = await call('POST', '/auth/login', { body: { email: 'doomed@email.com', password: 'secret123' } });
+      assert.equal(login.status, 401);
+
+      // El otro usuario conserva su producto y su foto.
+      const left = await call('GET', '/products', { token: survivor.token });
+      assert.equal(left.json.products.length, 1);
+      assert.equal((await rawGet(`/products/${b.id}/receipt`, survivor.token)).status, 200);
+
+      // El email queda libre: se puede volver a registrar.
+      const again = await call('POST', '/auth/register', {
+        body: { name: 'Doomed Again', email: 'doomed@email.com', password: 'secret123' },
+      });
+      assert.equal(again.status, 201);
+
+      // Limpieza: dejamos la carpeta de fotos como estaba para no afectar a otros tests.
+      await call('DELETE', `/products/${b.id}`, { token: survivor.token });
+      assert.equal(filesInUploads(), before);
+    });
+
+    it('protects /auth/me and /products', async () => {
+      assert.equal((await call('GET', '/auth/me')).status, 401);
+      assert.equal((await call('GET', '/products')).status, 401);
+
+      const { token, user } = await register('me@email.com');
+      const me = await call('GET', '/auth/me', { token });
+      assert.equal(me.status, 200);
+      assert.equal(me.json.user.id, user.id);
+
+      assert.equal((await call('GET', '/auth/me', { token: token + 'x' })).status, 401);
+      const expired = jwt.sign({}, SECRET, { subject: user.id, algorithm: 'HS256', expiresIn: -10 });
+      assert.equal((await call('GET', '/auth/me', { token: expired })).status, 401);
+      const forged = jwt.sign({}, 'another-secret-another-secret-12345678', { subject: user.id });
+      assert.equal((await call('GET', '/auth/me', { token: forged })).status, 401);
+    });
+
+    it('creates a product with sensible defaults and an automatic purchase entry', async () => {
+      const { token } = await register('create@email.com');
+      const r = await call('POST', '/products', { token, body: validProduct });
+      assert.equal(r.status, 201);
+      const p = r.json.product;
+      assert.equal(p.name, 'HP Victus 16');
+      assert.equal(p.icon, '📱');
+      assert.equal(p.subCategory, 'Tech');
+      assert.equal(p.serialNumber, 'N/A');
+      assert.equal(p.calendarEventId, undefined);
+      assert.equal(p.documentation.length, 3);
+      assert.equal(p.maintenanceHistory.length, 1);
+      assert.equal(p.maintenanceHistory[0].type, 'purchase');
+      assert.equal(p.maintenanceHistory[0].cost, 1850000);
+      assert.equal(p.userId, undefined);
+    });
+
+    it('validates product input', async () => {
+      const { token } = await register('invalid@email.com');
+      const bad = async (patch: object) => (await call('POST', '/products', { token, body: { ...validProduct, ...patch } })).status;
+      assert.equal(await bad({ name: '   ' }), 400);
+      assert.equal(await bad({ price: 0 }), 400);
+      assert.equal(await bad({ price: 10.5 }), 400);
+      assert.equal(await bad({ category: 'Cars' }), 400);
+      assert.equal(await bad({ purchaseDate: '2026-02-31' }), 400);
+      assert.equal(await bad({ warrantyExpiryDate: '2026-08-13' }), 400);
+      assert.equal(await bad({ warrantyExpiryDate: '2020-01-01' }), 400);
+    });
+
+    it('lists only the logged-in user products and hides other users products behind a 404', async () => {
+      const a = await register('owner@email.com');
+      const b = await register('stranger@email.com');
+      const created = await call('POST', '/products', { token: a.token, body: validProduct });
+      const id = created.json.product.id;
+
+      assert.equal((await call('GET', '/products', { token: a.token })).json.products.length, 1);
+      assert.equal((await call('GET', '/products', { token: b.token })).json.products.length, 0);
+
+      assert.equal((await call('GET', `/products/${id}`, { token: b.token })).status, 404);
+      assert.equal((await call('PATCH', `/products/${id}`, { token: b.token, body: { store: 'Hacked' } })).status, 404);
+      assert.equal((await call('DELETE', `/products/${id}`, { token: b.token })).status, 404);
+      assert.equal((await call('POST', `/products/${id}/maintenance`, {
+        token: b.token,
+        body: { date: '2026-09-01', title: 'x', type: 'maintenance' },
+      })).status, 404);
+
+      const still = await call('GET', `/products/${id}`, { token: a.token });
+      assert.equal(still.json.product.store, 'Fravega');
+    });
+
+    it('updates a product, sets and clears calendarEventId, and checks dates against stored values', async () => {
+      const { token } = await register('patch@email.com');
+      const id = (await call('POST', '/products', { token, body: validProduct })).json.product.id;
+
+      const store = await call('PATCH', `/products/${id}`, { token, body: { store: 'Garbarino' } });
+      assert.equal(store.status, 200);
+      assert.equal(store.json.product.store, 'Garbarino');
+      assert.equal(store.json.product.name, 'HP Victus 16');
+      assert.equal(store.json.product.serialNumber, 'N/A');
+
+      const synced = await call('PATCH', `/products/${id}`, { token, body: { calendarEventId: 'evt-1' } });
+      assert.equal(synced.json.product.calendarEventId, 'evt-1');
+      const cleared = await call('PATCH', `/products/${id}`, { token, body: { calendarEventId: null } });
+      assert.equal(cleared.json.product.calendarEventId, undefined);
+
+      const earlier = await call('PATCH', `/products/${id}`, { token, body: { warrantyExpiryDate: '2026-01-01' } });
+      assert.equal(earlier.status, 400);
+      assert.ok(earlier.json.fields.warrantyExpiryDate);
+
+      assert.equal((await call('PATCH', `/products/${id}`, { token, body: {} })).status, 400);
+    });
+
+    it('adds maintenance entries in date order and deletes products', async () => {
+      const { token } = await register('maint@email.com');
+      const id = (await call('POST', '/products', { token, body: validProduct })).json.product.id;
+
+      await call('POST', `/products/${id}/maintenance`, {
+        token,
+        body: { date: '2027-03-14', title: 'Battery replacement', provider: 'iService', cost: 85000, type: 'maintenance' },
+      });
+      const r = await call('POST', `/products/${id}/maintenance`, {
+        token,
+        body: { date: '2026-12-20', title: 'Fan cleaning', type: 'maintenance' },
+      });
+      assert.equal(r.status, 201);
+      assert.deepEqual(
+        r.json.product.maintenanceHistory.map((m: { title: string }) => m.title),
+        ['Product purchased', 'Fan cleaning', 'Battery replacement']
+      );
+
+      assert.equal((await call('DELETE', `/products/${id}`, { token })).status, 204);
+      assert.equal((await call('GET', `/products/${id}`, { token })).status, 404);
+    });
+
+    it('uploads a receipt photo, serves the same bytes to its owner and nobody else', async () => {
+      const owner = await register('photo-owner@email.com');
+      const other = await register('photo-other@email.com');
+      const created = (await call('POST', '/products', { token: owner.token, body: validProduct })).json.product;
+      assert.equal(created.receiptPhotoId, undefined);
+      assert.equal((await rawGet(`/products/${created.id}/receipt`, owner.token)).status, 404); // todavía sin foto
+
+      const photo = jpeg();
+      const up = await call('PUT', `/products/${created.id}/receipt`, { token: owner.token, body: { image: photo.toString('base64') } });
+      assert.equal(up.status, 200);
+      assert.match(up.json.product.receiptPhotoId, /^[0-9a-f-]{36}$/);
+      assert.equal(JSON.stringify(up.json).includes('.jpg'), false); // no se filtra el nombre del archivo
+      assert.equal(filesInUploads(), 1);
+
+      const got = await rawGet(`/products/${created.id}/receipt`, owner.token);
+      assert.equal(got.status, 200);
+      assert.equal(got.type, 'image/jpeg');
+      assert.ok(got.bytes.equals(photo));
+
+      assert.equal((await rawGet(`/products/${created.id}/receipt`)).status, 401);
+      assert.equal((await rawGet(`/products/${created.id}/receipt`, other.token)).status, 404);
+      assert.equal((await call('PUT', `/products/${created.id}/receipt`, { token: other.token, body: { image: photo.toString('base64') } })).status, 404);
+      assert.equal((await call('PUT', `/products/${created.id}/receipt`, { body: { image: photo.toString('base64') } })).status, 401);
+
+      // La foto aparece al listar y al pedir el detalle
+      assert.equal((await call('GET', '/products', { token: owner.token })).json.products.find((p: any) => p.id === created.id).receiptPhotoId, up.json.product.receiptPhotoId);
+    });
+
+    it('rejects photos that are not valid JPEGs or are too large', async () => {
+      const { token } = await register('photo-invalid@email.com');
+      const id = (await call('POST', '/products', { token, body: validProduct })).json.product.id;
+      const put = (image: unknown) => call('PUT', `/products/${id}/receipt`, { token, body: { image } });
+      const before = filesInUploads();
+
+      assert.equal((await call('PUT', `/products/${id}/receipt`, { token, body: {} })).status, 400);
+      assert.equal((await put('')).status, 400);
+      assert.equal((await put('esto no es base64!!')).status, 400);
+      assert.equal((await put('data:image/jpeg;base64,' + jpeg().toString('base64'))).status, 400);
+      const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(100)]);
+      const notJpeg = await put(png.toString('base64'));
+      assert.equal(notJpeg.status, 400);
+      assert.deepEqual(notJpeg.json.fields.image, ['Only JPEG images or PDF files are accepted.']);
+
+      const tooBig = Buffer.concat([jpeg(), Buffer.alloc(5 * 1024 * 1024)]); // > 5 MB
+      const big = await put(tooBig.toString('base64'));
+      assert.equal(big.status, 400);
+      assert.match(big.json.fields.image[0], /too large/);
+
+      // Un cuerpo de más de 7 MB ni siquiera se lee
+      assert.equal((await put('A'.repeat(8 * 1024 * 1024))).status, 413);
+      assert.equal(filesInUploads(), before); // nada quedó guardado
+    });
+
+    it('accepts a PDF receipt and serves it as a PDF', async () => {
+      const { token } = await register('receipt-pdf@email.com');
+      const id = (await call('POST', '/products', { token, body: validProduct })).json.product.id;
+
+      const file = pdf();
+      const up = await call('PUT', `/products/${id}/receipt`, { token, body: { image: file.toString('base64') } });
+      assert.equal(up.status, 200);
+      assert.equal(up.json.product.documentKinds.receipt, 'pdf');
+      assert.match(up.json.product.receiptPhotoId, /^[0-9a-f-]{36}$/);
+      assert.equal(JSON.stringify(up.json).includes('.pdf'), false); // no se filtra el nombre del archivo
+
+      const got = await rawGet(`/products/${id}/receipt`, token);
+      assert.equal(got.status, 200);
+      assert.match(got.type ?? '', /^application\/pdf/);
+      assert.ok(got.bytes.equals(file));
+
+      const photo = await call('PUT', `/products/${id}/receipt`, { token, body: { image: jpeg().toString('base64') } });
+      assert.equal(photo.json.product.documentKinds.receipt, 'image');
+
+      // Los otros documentos también aceptan PDF
+      const manual = await call('PUT', `/products/${id}/documents/manual`, { token, body: { image: file.toString('base64') } });
+      assert.equal(manual.status, 200);
+      assert.equal(manual.json.product.documentKinds.manual, 'pdf');
+      const gotManual = await rawGet(`/products/${id}/documents/manual`, token);
+      assert.match(gotManual.type ?? '', /^application\/pdf/);
+      assert.ok(gotManual.bytes.equals(file));
+    });
+
+    it('replaces the photo (deleting the old file) and deletes it together with the product', async () => {
+      const { token } = await register('photo-replace@email.com');
+      const id = (await call('POST', '/products', { token, body: validProduct })).json.product.id;
+      const start = filesInUploads();
+
+      const first = await call('PUT', `/products/${id}/receipt`, { token, body: { image: jpeg(1).toString('base64') } });
+      const second = await call('PUT', `/products/${id}/receipt`, { token, body: { image: jpeg(2).toString('base64') } });
+      assert.notEqual(first.json.product.receiptPhotoId, second.json.product.receiptPhotoId);
+      assert.equal(filesInUploads(), start + 1); // el archivo viejo se borró
+      assert.ok((await rawGet(`/products/${id}/receipt`, token)).bytes.equals(jpeg(2)));
+
+      assert.equal((await call('DELETE', `/products/${id}`, { token })).status, 204);
+      assert.equal(filesInUploads(), start); // y al borrar el producto, también la foto
+    });
+
+    it('keeps a separate photo for the receipt, the warranty document and the manual', async () => {
+      const owner = await register('docs-owner@email.com');
+      const other = await register('docs-other@email.com');
+      const id = (await call('POST', '/products', { token: owner.token, body: validProduct })).json.product.id;
+      const start = filesInUploads();
+      const flags = (product: any) => Object.fromEntries(product.documentation.map((d: any) => [d.name, d.uploaded]));
+
+      const created = (await call('GET', `/products/${id}`, { token: owner.token })).json.product;
+      assert.deepEqual(created.documents, {}); // sin fotos todavía
+      assert.equal((await rawGet(`/products/${id}/documents/manual`, owner.token)).status, 404); // todavía sin foto
+
+      // Cada tipo guarda su propia foto, sin pisar a los otros
+      const photos = { receipt: jpeg(11), warranty: jpeg(22), manual: jpeg(33) };
+      for (const [type, bytes] of Object.entries(photos)) {
+        const up = await call('PUT', `/products/${id}/documents/${type}`, { token: owner.token, body: { image: bytes.toString('base64') } });
+        assert.equal(up.status, 200, type);
+        assert.match(up.json.product.documents[type], /^[0-9a-f-]{36}$/);
+      }
+      assert.equal(filesInUploads(), start + 3);
+      for (const [type, bytes] of Object.entries(photos)) {
+        const got = await rawGet(`/products/${id}/documents/${type}`, owner.token);
+        assert.equal(got.status, 200, type);
+        assert.equal(got.type, 'image/jpeg');
+        assert.ok(got.bytes.equals(bytes), `${type} devuelve su propia foto`);
+      }
+
+      // La lista "documentation" marca cada documento como subido
+      const afterUpload = (await call('GET', `/products/${id}`, { token: owner.token })).json.product;
+      assert.deepEqual(flags(afterUpload), { Receipt: true, 'Warranty document': true, Manual: true });
+      assert.equal(afterUpload.receiptPhotoId, afterUpload.documents.receipt); // compatibilidad
+      assert.equal(JSON.stringify(afterUpload).includes('.jpg'), false);
+
+      // El camino anterior /receipt sigue apuntando al recibo
+      assert.ok((await rawGet(`/products/${id}/receipt`, owner.token)).bytes.equals(photos.receipt));
+
+      // Reemplazar uno no toca los otros y borra su archivo viejo
+      const replaced = await call('PUT', `/products/${id}/documents/warranty`, { token: owner.token, body: { image: jpeg(44).toString('base64') } });
+      assert.notEqual(replaced.json.product.documents.warranty, afterUpload.documents.warranty);
+      assert.equal(replaced.json.product.documents.manual, afterUpload.documents.manual);
+      assert.equal(filesInUploads(), start + 3);
+
+      // Solo el dueño, y con login
+      assert.equal((await rawGet(`/products/${id}/documents/manual`, other.token)).status, 404);
+      assert.equal((await rawGet(`/products/${id}/documents/manual`)).status, 401);
+      assert.equal((await call('PUT', `/products/${id}/documents/manual`, { token: other.token, body: { image: jpeg().toString('base64') } })).status, 404);
+      assert.equal((await call('DELETE', `/products/${id}/documents/manual`, { token: other.token })).status, 404);
+      assert.equal((await call('DELETE', `/products/${id}/documents/manual`)).status, 401);
+
+      // Tipos inventados no existen
+      assert.equal((await call('PUT', `/products/${id}/documents/passport`, { token: owner.token, body: { image: jpeg().toString('base64') } })).status, 404);
+      assert.equal((await rawGet(`/products/${id}/documents/passport`, owner.token)).status, 404);
+
+      // Quitar un documento: borra el archivo, apaga su marca y deja los demás
+      const removed = await call('DELETE', `/products/${id}/documents/manual`, { token: owner.token });
+      assert.equal(removed.status, 200);
+      assert.equal(removed.json.product.documents.manual, undefined);
+      assert.deepEqual(flags(removed.json.product), { Receipt: true, 'Warranty document': true, Manual: false });
+      assert.equal(filesInUploads(), start + 2);
+      assert.equal((await rawGet(`/products/${id}/documents/manual`, owner.token)).status, 404);
+      assert.equal((await call('DELETE', `/products/${id}/documents/manual`, { token: owner.token })).status, 404); // ya no tiene
+
+      // Los límites de la subida valen para los tres tipos
+      const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(100)]);
+      assert.equal((await call('PUT', `/products/${id}/documents/manual`, { token: owner.token, body: { image: png.toString('base64') } })).status, 400);
+      assert.equal((await call('PUT', `/products/${id}/documents/manual`, { token: owner.token, body: { image: 'A'.repeat(8 * 1024 * 1024) } })).status, 413);
+      assert.equal(filesInUploads(), start + 2);
+
+      // Al borrar el producto se borran todas sus fotos
+      assert.equal((await call('DELETE', `/products/${id}`, { token: owner.token })).status, 204);
+      assert.equal(filesInUploads(), start);
+    });
+
+    it('keeps rejecting big bodies on every other route', async () => {
+      const r = await call('POST', '/auth/login', { body: { email: 'a@b.com', password: 'x'.repeat(200_000) } });
+      assert.equal(r.status, 413);
+    });
+
+    it('answers malformed JSON with 400 and unknown routes with 404', async () => {
+      const bad = await call('POST', '/auth/login', { raw: '{not json' });
+      assert.equal(bad.status, 400);
+      assert.equal((await call('GET', '/nope')).status, 404);
+    });
+  });
+}
